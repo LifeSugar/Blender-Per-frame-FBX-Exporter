@@ -1,7 +1,7 @@
 # Blender Add-on metadata
 bl_info = {
     "name": "FBX Sequence Exporter",
-    "author": "GouGouTang",
+    "author": "GouGouTang https://github.com/LifeSugar/Blender-Per-frame-FBX-Exporter",
     "version": (1, 4),
     "blender": (2, 83, 0),
     "location": "3D Viewport > Sidebar (N) > FBX Exporter",
