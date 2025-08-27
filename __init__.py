@@ -1,8 +1,21 @@
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTIBILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 # Blender Add-on metadata
 bl_info = {
     "name": "FBX Sequence Exporter",
     "author": "GouGouTang https://github.com/LifeSugar/Blender-Per-frame-FBX-Exporter",
-    "version": (1, 6),
+    "version": (1, 7),  # bumped from (1, 6)
     "blender": (2, 83, 0),
     "location": "3D Viewport > Sidebar (N) > FBX Exporter",
     "description": "Export per-frame FBX sequence or per-object FBX with flexible naming, ordering and transform options.",
@@ -221,6 +234,71 @@ def _ordered_selected_objects(context, order_mode: str):
         out.append(obj)
     return out
 
+def _export_selected_to_fbx(context, filepath, props):
+    """Call FBX export with current selection using props."""
+    bpy.ops.export_scene.fbx(
+        filepath=filepath,
+        use_selection=True,
+        global_scale=props.global_scale,
+        apply_scale_options=_map_apply_scalings(props.apply_scalings),
+        axis_forward=props.axis_forward,
+        axis_up=props.axis_up,
+        bake_space_transform=props.bake_space_transform,
+        use_mesh_modifiers=props.use_mesh_modifiers,
+        bake_anim=props.bake_anim,
+        bake_anim_use_nla_strips=False,
+        bake_anim_use_all_actions=False,
+        object_types={'MESH', 'ARMATURE', 'EMPTY'},
+    )
+
+def _export_one_with_curve_handling(context, obj, filepath, props):
+    """
+    如果对象是 CURVE：评估 -> 生成临时 Mesh -> 仅导出该 Mesh -> 删除临时对象与数据
+    否则：按原逻辑选中并导出
+    """
+    # 确保当前帧已就绪（外部已 frame_set）
+    if obj.type == 'CURVE':
+        depsgraph = context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(depsgraph)
+
+        # 生成评估后的网格（包含几何节点/实例化后的结果）
+        try:
+            mesh = bpy.data.meshes.new_from_object(
+                eval_obj, depsgraph=depsgraph, preserve_all_data_layers=True
+            )
+        except TypeError:
+            # 兼容早期 Blender 版本签名
+            mesh = bpy.data.meshes.new_from_object(eval_obj, depsgraph=depsgraph)
+
+        tmp_obj = bpy.data.objects.new(name=f"{obj.name}_TMP_MESH", object_data=mesh)
+        tmp_obj.matrix_world = obj.matrix_world.copy()
+
+        # 链接到场景（或也可链接到 obj 所在的第一个集合）
+        context.scene.collection.objects.link(tmp_obj)
+
+        # 仅选择临时对象导出
+        bpy.ops.object.select_all(action='DESELECT')
+        tmp_obj.select_set(True)
+        context.view_layer.objects.active = tmp_obj
+
+        _export_selected_to_fbx(context, filepath, props)
+
+        # 清理临时对象与数据
+        try:
+            bpy.data.objects.remove(tmp_obj, do_unlink=True)
+        except RuntimeError:
+            pass
+        try:
+            if mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
+        except RuntimeError:
+            pass
+    else:
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        _export_selected_to_fbx(context, filepath, props)
+
 # --------------------- Export (Modal) ---------------------
 class WM_OT_ExportFbxSequence(bpy.types.Operator):
     """Export per-frame sequence or per-object FBX with progress"""
@@ -313,10 +391,6 @@ class WM_OT_ExportFbxSequence(bpy.types.Operator):
             obj = self._objects[self._object_index]
             context.scene.frame_set(self._current_frame)
 
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-
             base = _sanitize(_build_base_name(obj, self._props))
             seq_str = f"{(self._exported_count + 1):0{SEQ_PAD}d}"
             if self._step > 1:
@@ -325,20 +399,8 @@ class WM_OT_ExportFbxSequence(bpy.types.Operator):
                 name_prefix = f"{base}_frame_"
             filepath = os.path.join(self._export_folder, f"{name_prefix}{seq_str}.fbx")
 
-            bpy.ops.export_scene.fbx(
-                filepath=filepath,
-                use_selection=True,
-                global_scale=self._props.global_scale,
-                apply_scale_options=_map_apply_scalings(self._props.apply_scalings),
-                axis_forward=self._props.axis_forward,
-                axis_up=self._props.axis_up,
-                bake_space_transform=self._props.bake_space_transform,
-                use_mesh_modifiers=self._props.use_mesh_modifiers,
-                bake_anim=self._props.bake_anim,
-                bake_anim_use_nla_strips=False,
-                bake_anim_use_all_actions=False,
-                object_types={'MESH', 'ARMATURE', 'EMPTY'},
-            )
+            # === 改动：支持曲线按帧临时转网格导出 ===
+            _export_one_with_curve_handling(context, obj, filepath, self._props)
 
             self._exported_count += 1
             if USE_SYSTEM_PROGRESS_HUD:
@@ -365,30 +427,14 @@ class WM_OT_ExportFbxSequence(bpy.types.Operator):
             obj = self._objects[self._obj_single_index]
             context.scene.frame_set(self._single_frame)
 
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-
             base = _sanitize(_build_base_name(obj, self._props))
             idx = self._obj_single_index + 1
             idx_str = str(idx).zfill(max(1, self._props.object_index_digits))
             # pattern: <base>_<idx>.fbx
             filepath = os.path.join(self._export_folder, f"{base}_{idx_str}.fbx")
 
-            bpy.ops.export_scene.fbx(
-                filepath=filepath,
-                use_selection=True,
-                global_scale=self._props.global_scale,
-                apply_scale_options=_map_apply_scalings(self._props.apply_scalings),
-                axis_forward=self._props.axis_forward,
-                axis_up=self._props.axis_up,
-                bake_space_transform=self._props.bake_space_transform,
-                use_mesh_modifiers=self._props.use_mesh_modifiers,
-                bake_anim=self._props.bake_anim,
-                bake_anim_use_nla_strips=False,
-                bake_anim_use_all_actions=False,
-                object_types={'MESH', 'ARMATURE', 'EMPTY'},
-            )
+            # === 改动：PER_OBJECT 也支持曲线临时转网格 ===
+            _export_one_with_curve_handling(context, obj, filepath, self._props)
 
             self._obj_single_index += 1
             self._exported_count += 1
@@ -531,7 +577,7 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Scene.fbx_exporter_props = bpy.props.PointerProperty(type=FBXExporterProperties)
     bpy.types.STATUSBAR_HT_header.append(_draw_statusbar)
-    print("[FBX Sequence Exporter] Registered v1.6")
+    print("[FBX Sequence Exporter] Registered v1.7")
 
 def unregister():
     try:
